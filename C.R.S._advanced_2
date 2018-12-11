@@ -1,0 +1,939 @@
+# -*- coding: utf-8 -*-
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import openpyxl
+
+np.seterr(divide='ignore', invalid='ignore', over='ignore', under='ignore')
+from sklearn.decomposition import PCA
+from sklearn import linear_model, preprocessing, mixture, manifold, ensemble
+from sklearn.preprocessing import OneHotEncoder
+
+np.set_printoptions(threshold=np.inf)
+from scipy import optimize
+
+global result_G
+
+colorlist = ["r", "g", "b", "c", "m", "y", "k", "lime", "gray", "olive"]
+
+'''
+feature_value_num	feature_name	definition
+1	young	最初の点からyoung_areaで指定した点の間の傾きを取得
+2	max_stress	最大応力を取得
+3	yeild_stress_0.01	0.01％耐力
+4	yield_stress_0.2	0.2％耐力
+5	yield_stress_0.5	0.5％耐力
+6	yield_stress_1.0	1％耐力
+7	yield_stress_5.0	5％耐力
+8	yield_stress_10.0	10％耐力
+9	energy_A	弾性エネルギ
+10	energy_B	塑性変形エネルギー前半部
+11	energy_C	塑性変形エネルギー後半部
+12	energy_A+B	
+13	energy_A+C	
+14	energy_B+C	
+15	energy_A+B+C	
+16	exponential_regression_A	弾性域の指数関数によるフィッティング
+17	exponential_regression_B	最大応力点までの指数関数によるフィッティング
+18	yield&max_stress	最大応力　/　0.2％耐力
+19	yeild&max_strain	最大応力時のひずみ　/　0.002
+20	young&max_stress	ヤング率　/　最大応力
+21	young&max_strain	ヤング率　/　最大応力時のひずみ
+22	yield_to_max_stress&strain	降伏点（0.2％耐力）と最大応力点の２点間の傾き
+23	g_rectangle_stress	省略
+24	g_rectangle_strain	省略
+25	g_rectangle_norm	省略
+26	g_vector_2_norm	省略
+27	g_vector_2_stress	省略
+28	g_vector_2_strain	省略
+29	g_vector_3_norm	省略
+30	g_vector_3_stress	省略
+31	g_vector_3_strain	省略
+32	g_vector_4_norm	省略
+33	g_vector_4_stress	省略
+34	g_vector_4_strain	省略
+35	g_vector_5_norm	省略
+36	g_vector_5_stress	省略
+37	g_vector_5_strain	省略
+38	1st_order_derivative_sum	カーブ全体の各点における微分値の総和
+39	2nd_order_derivative_sum	カーブ全体の各点における2階微分値の総和
+40	rolling_differential	各点における移動平均前後の差の総和
+'''
+
+
+# fv1
+def young(x, y, young_area):
+    E = y[young_area] / x[young_area]
+    return (E)
+
+
+# fv2
+def max_stress(y):
+    sigma_max = max(y)
+    return (sigma_max)
+
+
+# fv3~fv8
+def yield_stress(x, y, young_area, yield_threshold):
+    y_dash = np.arange(len(x), dtype='float64')
+    b = - young(x, y, young_area) * yield_threshold
+
+    for j in range(len(x)):
+        y_dash[j] = young(x, y, young_area) * x[j] + b
+
+    gap = np.abs(y - y_dash)
+    yield_index = np.argmin(gap)
+    sigma_y = y[yield_index]
+    return (sigma_y)
+
+
+# fv9
+def energy_A(x, y, young_area, yield_threshold):
+    y_dash = np.arange(len(x), dtype='float64')
+    b = - young(x, y, young_area) * yield_threshold
+
+    for j in range(1, len(x) - 1):
+        y_dash[j] = young(x, y, young_area) * x[j] + b
+
+    gap = np.abs(y - y_dash)
+    yield_index = np.argmin(gap)
+
+    integrate_area = 0
+    for i in range(yield_index):
+        d_area = y[i] * (x[i + 1] - x[i])
+        integrate_area = integrate_area + d_area
+    return (integrate_area)
+
+
+# fv10
+def energy_B(x, y, young_area, yield_threshold):
+    y_dash = np.arange(len(x), dtype='float64')
+    b = - young(x, y, young_area) * yield_threshold
+
+    for j in range(1, len(x) - 1):
+        y_dash[j] = young(x, y, young_area) * x[j] + b
+
+    gap = np.abs(y - y_dash)
+    yield_index = np.argmin(gap)
+    max_stress_index = np.argmax(y)
+
+    integrate_area = 0
+    for i in range(yield_index, max_stress_index):
+        d_area = y[i] * (x[i + 1] - x[i])
+        integrate_area = integrate_area + d_area
+    return (integrate_area)
+
+
+# fv11
+def energy_C(x, y):
+    max_stress_index = np.argmax(y)
+    end_of_curve_index = len(x)
+
+    integrate_area = 0
+    for i in range(max_stress_index, end_of_curve_index - 1):
+        d_area = y[i] * (x[i + 1] - x[i])
+        integrate_area = integrate_area + d_area
+    return (integrate_area)
+
+
+# fv12
+def energy_A_B(x, y, young_area, yield_threshold):
+    A_B = energy_A(x, y, young_area, yield_threshold) + energy_B(x, y, young_area, yield_threshold)
+    return (A_B)
+
+
+# vf13
+def energy_A_C(x, y, young_area, yield_threshold):
+    A_C = energy_A(x, y, young_area, yield_threshold) + energy_C(x, y)
+    return (A_C)
+
+
+# fv14
+def energy_B_C(x, y, young_area, yield_threshold):
+    B_C = energy_B(x, y, young_area, yield_threshold) + energy_C(x, y)
+    return (B_C)
+
+
+# fv15
+def energy_A_B_C(x, y, young_area, yield_threshold):
+    A_B_C = energy_A_B(x, y, young_area, yield_threshold) + energy_C(x, y)
+    return (A_B_C)
+
+
+# fv16
+def func(x, a, b, c):
+    return b * x ** (1 / a) + c
+
+
+def exponential_regression_A(x, y, young_area, yield_threshold):
+    y_dash = np.arange(len(x), dtype='float64')
+    b = - young(x, y, young_area) * yield_threshold
+    for j in range(len(x)):
+        y_dash[j] = young(x, y, young_area) * x[j] + b
+
+    gap = np.abs(y - y_dash)
+    yield_index = np.argmin(gap)
+    x_hat = x[1:yield_index]
+    y_hat = y[1:yield_index]
+    popt, pcov = optimize.curve_fit(func, x_hat, y_hat, p0=[2, 1, 0])
+    return (popt[0])
+
+
+# fv17
+def exponential_regression_B(x, y, young_area, yield_threshold):
+    max_stress_index = np.argmax(y)
+    x_hat = x[1:max_stress_index]
+    y_hat = y[1:max_stress_index]
+    popt, pcov = optimize.curve_fit(func, x_hat, y_hat, p0=[2, 1, 0])
+    return (popt[0])
+
+
+# fv18
+def yield_and_max_stress(x, y, young_area, yield_threshold):
+    y_dash = np.arange(len(x), dtype='float64')
+    b = - young(x, y, young_area) * yield_threshold
+
+    for j in range(len(x)):
+        y_dash[j] = young(x, y, young_area) * x[j] + b
+
+    gap = np.abs(y - y_dash)
+    yield_index = np.argmin(gap)
+    max_stress_index = np.argmax(y)
+
+    correlation_val = y[max_stress_index] / y[yield_index]
+    return (correlation_val)
+
+
+# fv19
+def yield_and_max_strain(x, y, young_area, yield_threshold):
+    y_dash = np.arange(len(x), dtype='float64')
+    b = - young(x, y, young_area) * yield_threshold
+
+    for j in range(len(x)):
+        y_dash[j] = young(x, y, young_area) * x[j] + b
+
+    gap = np.abs(y - y_dash)
+    yield_index = np.argmin(gap)
+    max_stress_index = np.argmax(y)
+
+    correlation_val = x[max_stress_index] / x[yield_index]
+    return (correlation_val)
+
+
+# fv20
+def young_and_max_stress(x, y, young_area):
+    correlation_val = young(x, y, young_area) / max(y)
+    return (correlation_val)
+
+
+# fv21
+def young_and_max_strain(x, y, young_area):
+    correlation_val = young(x, y, young_area) / x[np.argmax(y)]
+    return (correlation_val)
+
+
+# fv22
+def yield_to_max_stress_and_strain(x, y, young_area, yield_threshold):
+    y_dash = np.arange(len(x), dtype='float64')
+    b = - young(x, y, young_area) * yield_threshold
+
+    for j in range(len(x)):
+        y_dash[j] = young(x, y, young_area) * x[j] + b
+
+    gap = np.abs(y - y_dash)
+    yield_index = np.argmin(gap)
+    max_stress_index = np.argmax(y)
+
+    slope = (max(y) - y[yield_index]) / (x[max_stress_index] - x[yield_index])
+    return (slope)
+
+
+# fv23
+def g_rectangle_stress(x, y, young_area, yield_threshold):
+    y_dash = np.arange(len(x), dtype='float64')
+    b = - young(x, y, young_area) * yield_threshold
+
+    for j in range(len(x)):
+        y_dash[j] = young(x, y, young_area) * x[j] + b
+
+    gap = np.abs(y - y_dash)
+    yield_index = np.argmin(gap)
+    max_stress_index = np.argmax(y)
+
+    vector_x = np.array([0, 0, 0, 0, 0])
+    vector_y = np.array([0, 0, 0, 0, 0])
+    vector_x[0], vector_y[0] = 0, 0
+    vector_x[1] = x[yield_index]
+    vector_y[1] = y[yield_index]
+    vector_x[2] = x[max_stress_index]
+    vector_y[2] = max(y)
+    vector_x[3] = x[len(x) - 1]
+    vector_y[3] = y[len(x) - 1]
+    vector_x[4] = x[len(x) - 1]
+    vector_y[4] = 0
+    G_x = sum(vector_x) / 5
+    G_y = sum(vector_y) / 5
+    L2_norm = np.sqrt(G_x ** 2 + G_y ** 2)
+    return (G_y)
+
+
+# fv24
+def g_rectangle_strain(x, y, young_area, yield_threshold):
+    y_dash = np.arange(len(x), dtype='float64')
+    b = - young(x, y, young_area) * yield_threshold
+
+    for j in range(len(x)):
+        y_dash[j] = young(x, y, young_area) * x[j] + b
+
+    gap = np.abs(y - y_dash)
+    yield_index = np.argmin(gap)
+    max_stress_index = np.argmax(y)
+
+    vector_x = np.array([0, 0, 0, 0, 0], dtype="float64")
+    vector_y = np.array([0, 0, 0, 0, 0], dtype="float64")
+    vector_x[0], vector_y[0] = 0, 0
+    vector_x[1] = x[yield_index]
+    vector_y[1] = y[yield_index]
+    vector_x[2] = x[max_stress_index]
+    vector_y[2] = max(y)
+    vector_x[3] = x[len(x) - 1]
+    vector_y[3] = y[len(x) - 1]
+    vector_x[4] = x[len(x) - 1]
+    vector_y[4] = 0
+    G_x = sum(vector_x) / 5
+    G_y = sum(vector_y) / 5
+    L2_norm = np.sqrt(G_x ** 2 + G_y ** 2)
+    return (G_x)
+
+
+# fv25
+def g_rectangle_norm(x, y, young_area, yield_threshold):
+    y_dash = np.arange(len(x), dtype='float64')
+    b = - young(x, y, young_area) * yield_threshold
+
+    for j in range(len(x)):
+        y_dash[j] = young(x, y, young_area) * x[j] + b
+
+    gap = np.abs(y - y_dash)
+    yield_index = np.argmin(gap)
+    max_stress_index = np.argmax(y)
+
+    vector_x = np.array([0, 0, 0, 0, 0])
+    vector_y = np.array([0, 0, 0, 0, 0])
+    vector_x[0], vector_y[0] = 0, 0
+    vector_x[1] = x[yield_index]
+    vector_y[1] = y[yield_index]
+    vector_x[2] = x[max_stress_index]
+    vector_y[2] = max(y)
+    vector_x[3] = x[len(x) - 1]
+    vector_y[3] = y[len(x) - 1]
+    vector_x[4] = x[len(x) - 1]
+    vector_y[4] = 0
+    G_x = sum(vector_x) / 5
+    G_y = sum(vector_y) / 5
+    L2_norm = np.sqrt(G_x ** 2 + G_y ** 2)
+    return (L2_norm)
+
+
+# fv26~37
+def find_nearest(array, value):
+    n = [abs(i - value) for i in array]
+    idx = n.index(min(n))
+    return int(idx)
+
+
+def g_vector_norm(x, y, vector_num):
+    vector_point_x = np.arange(vector_num + 1, dtype='float64')
+    vector_point_y = np.arange(vector_num + 1, dtype='float64')
+    pos_vector_x = np.arange(vector_num, dtype='float64')
+    pos_vector_y = np.arange(vector_num, dtype='float64')
+
+    for j in range(1, vector_num + 1):
+        vector_index = (max(x) / vector_num) * j
+        vector_point_x[j] = x[find_nearest(x, vector_index)]
+        vector_point_y[j] = y[find_nearest(x, vector_index)]
+
+    for k in range(vector_num):
+        pos_vector_x[k] = vector_point_x[k + 1] - vector_point_x[k]
+        pos_vector_y[k] = vector_point_y[k + 1] - vector_point_y[k]
+
+    G_x = sum(pos_vector_x) / (vector_num + 1)
+    G_y = sum(pos_vector_y) / (vector_num + 1)
+    L2_norm = np.sqrt(G_x ** 2 + G_y ** 2)
+    return (L2_norm)
+
+
+def g_vector_stress(x, y, vector_num):
+    vector_point_x = np.arange(vector_num + 1, dtype='float64')
+    vector_point_y = np.arange(vector_num + 1, dtype='float64')
+    pos_vector_x = np.arange(vector_num, dtype='float64')
+    pos_vector_y = np.arange(vector_num, dtype='float64')
+
+    for j in range(1, vector_num + 1):
+        vector_index = (max(x) / vector_num) * j
+        vector_point_x[j] = x[find_nearest(x, vector_index)]
+        vector_point_y[j] = y[find_nearest(x, vector_index)]
+
+    for k in range(vector_num):
+        pos_vector_x[k] = vector_point_x[k + 1] - vector_point_x[k]
+        pos_vector_y[k] = vector_point_y[k + 1] - vector_point_y[k]
+
+    G_x = sum(pos_vector_x) / (vector_num + 1)
+    G_y = sum(pos_vector_y) / (vector_num + 1)
+    L2_norm = np.sqrt(G_x ** 2 + G_y ** 2)
+    return (G_y)
+
+
+def g_vector_strain(x, y, vector_num):
+    vector_point_x = np.arange(vector_num + 1, dtype='float64')
+    vector_point_y = np.arange(vector_num + 1, dtype='float64')
+    pos_vector_x = np.arange(vector_num, dtype='float64')
+    pos_vector_y = np.arange(vector_num, dtype='float64')
+
+    for j in range(1, vector_num + 1):
+        vector_index = (max(x) / vector_num) * j
+        vector_point_x[j] = x[find_nearest(x, vector_index)]
+        vector_point_y[j] = y[find_nearest(x, vector_index)]
+
+    for k in range(vector_num):
+        pos_vector_x[k] = vector_point_x[k + 1] - vector_point_x[k]
+        pos_vector_y[k] = vector_point_y[k + 1] - vector_point_y[k]
+
+    G_x = sum(pos_vector_x) / (vector_num + 1)
+    G_y = sum(pos_vector_y) / (vector_num + 1)
+    L2_norm = np.sqrt(G_x ** 2 + G_y ** 2)
+    return (G_x)
+
+
+# fv38
+def first_order_derivative(y):
+    y_hat = y[1:np.argmax(y)]
+    sigma_1 = sum(np.gradient(y_hat))
+    return (sigma_1)
+
+
+# fv39
+def second_order_derivative(y):
+    y_hat = y[1:np.argmax(y)]
+    sigma_2 = sum(np.gradient(np.gradient(y_hat)))
+    return (sigma_2)
+
+
+# fv40
+def rolling_differetial(y, window_number):
+    y_roll = (pd.Series(y)).rolling(window=window_number, min_periods=1).mean()
+    y_roll = np.array(y_roll).reshape(-1, )
+    differential = np.arange(len(y) - window_number, dtype="float64")
+    for j in range(len(y) - window_number):
+        differential = y - y_roll
+
+    differential_sum = sum(differential)
+    return (differential_sum)
+
+
+# ------------------------------------------------------------------------------------------------------------
+
+
+print('folder name?')
+folder_name = input()
+
+f_name = os.listdir(folder_name)  # 選択したフォルダー内のファイル名 がf_nameに格納される
+f_num = len(f_name)
+
+fv1 = np.arange(f_num, dtype='float64')  # 特徴量を格納するための準備
+fv2 = np.arange(f_num, dtype='float64')
+fv3 = np.arange(f_num, dtype='float64')
+fv4 = np.arange(f_num, dtype='float64')
+fv5 = np.arange(f_num, dtype='float64')
+fv6 = np.arange(f_num, dtype='float64')
+fv7 = np.arange(f_num, dtype='float64')
+fv8 = np.arange(f_num, dtype='float64')
+fv9 = np.arange(f_num, dtype='float64')
+fv10 = np.arange(f_num, dtype='float64')
+fv11 = np.arange(f_num, dtype='float64')
+fv12 = np.arange(f_num, dtype='float64')
+fv13 = np.arange(f_num, dtype='float64')
+fv14 = np.arange(f_num, dtype='float64')
+fv15 = np.arange(f_num, dtype='float64')
+fv16 = np.arange(f_num, dtype='float64')
+fv17 = np.arange(f_num, dtype='float64')
+fv18 = np.arange(f_num, dtype='float64')
+fv19 = np.arange(f_num, dtype='float64')
+fv20 = np.arange(f_num, dtype='float64')
+fv21 = np.arange(f_num, dtype='float64')
+fv22 = np.arange(f_num, dtype='float64')
+fv23 = np.arange(f_num, dtype='float64')
+fv24 = np.arange(f_num, dtype='float64')
+fv25 = np.arange(f_num, dtype='float64')
+fv26 = np.arange(f_num, dtype='float64')
+fv27 = np.arange(f_num, dtype='float64')
+fv28 = np.arange(f_num, dtype='float64')
+fv29 = np.arange(f_num, dtype='float64')
+fv30 = np.arange(f_num, dtype='float64')
+fv31 = np.arange(f_num, dtype='float64')
+fv32 = np.arange(f_num, dtype='float64')
+fv33 = np.arange(f_num, dtype='float64')
+fv34 = np.arange(f_num, dtype='float64')
+fv35 = np.arange(f_num, dtype='float64')
+fv36 = np.arange(f_num, dtype='float64')
+fv37 = np.arange(f_num, dtype='float64')
+fv38 = np.arange(f_num, dtype='float64')
+fv39 = np.arange(f_num, dtype='float64')
+fv40 = np.arange(f_num, dtype='float64')
+
+for i in range(f_num):  # 各ファイルについてSSカーブを作る
+    data = f_name[i]
+    print(data)
+    df = pd.read_csv(folder_name + "/" + data, encoding="shift-jis", header=None)
+    df_ = pd.isnull(df.iat[0, 3])
+
+    if (df_ == True):
+        cs = df.iat[0, 1]
+        nl = df.iat[0, 2]
+
+        x__ = df.iloc[1:, 3:4]
+        x_ = x__.values
+        x = x_ / nl
+        x = np.array(x).reshape(-1, )
+
+        y_ = df.iloc[1:, 1:2]
+        y = np.array(y_).reshape(-1, ) * 1000 / cs
+
+    else:
+        cs1 = df.iat[0, 1]
+        cs2 = df.iat[0, 2]
+        cs = cs1 * cs2
+        nl = df.iat[0, 3]
+
+        x__ = df.iloc[1:, 3:4]
+        x_ = x__.values
+        x = x_ / nl
+        x = np.array(x).reshape(-1, )
+
+        y_ = df.iloc[1:, 1:2]
+        y = np.array(y_).reshape(-1, ) * 1000 / cs
+
+    plt.plot(x, y)
+
+    # それぞれのカーブについて計算を実施する
+    fv1[i] = young(x, y, 50)
+    fv2[i] = max_stress(y)
+    fv3[i] = yield_stress(x, y, 50, 0.0001)
+    fv4[i] = yield_stress(x, y, 50, 0.002)
+    fv5[i] = yield_stress(x, y, 50, 0.005)
+    fv6[i] = yield_stress(x, y, 50, 0.01)
+    fv7[i] = yield_stress(x, y, 50, 0.05)
+    fv8[i] = yield_stress(x, y, 50, 0.1)
+    fv9[i] = energy_A(x, y, 50, 0.002)
+    fv10[i] = energy_B(x, y, 50, 0.002)
+    fv11[i] = energy_C(x, y)
+    fv12[i] = energy_A_B(x, y, 50, 0.002)
+    fv13[i] = energy_A_C(x, y, 50, 0.002)
+    fv14[i] = energy_B_C(x, y, 50, 0.002)
+    fv15[i] = energy_A_B_C(x, y, 50, 0.002)
+    fv16[i] = exponential_regression_A(x, y, 50, 0.002)
+    fv17[i] = exponential_regression_B(x, y, 50, 0.002)
+    fv18[i] = yield_and_max_stress(x, y, 50, 0.002)
+    fv19[i] = yield_and_max_strain(x, y, 50, 0.002)
+    fv20[i] = young_and_max_stress(x, y, 50)
+    fv21[i] = young_and_max_strain(x, y, 50)
+    fv22[i] = yield_to_max_stress_and_strain(x, y, 50, 0.002)
+    fv23[i] = g_rectangle_stress(x, y, 50, 0.002)
+    fv24[i] = g_rectangle_strain(x, y, 50, 0.002)
+    fv25[i] = g_rectangle_norm(x, y, 50, 0.002)
+    fv26[i] = g_vector_norm(x, y, 2)
+    fv27[i] = g_vector_stress(x, y, 2)
+    fv28[i] = g_vector_strain(x, y, 2)
+    fv29[i] = g_vector_norm(x, y, 3)
+    fv30[i] = g_vector_stress(x, y, 3)
+    fv31[i] = g_vector_strain(x, y, 3)
+    fv32[i] = g_vector_norm(x, y, 4)
+    fv33[i] = g_vector_stress(x, y, 4)
+    fv34[i] = g_vector_strain(x, y, 4)
+    fv35[i] = g_vector_norm(x, y, 5)
+    fv36[i] = g_vector_stress(x, y, 5)
+    fv37[i] - g_vector_strain(x, y, 5)
+    fv38[i] = first_order_derivative(y)
+    fv39[i] = second_order_derivative(y)
+    fv40[i] = rolling_differetial(y, 100)
+
+plt.show()
+
+fv1_mean = np.mean(fv1)
+fv2_mean = np.mean(fv2)
+fv3_mean = np.mean(fv3)
+fv4_mean = np.mean(fv4)
+fv5_mean = np.mean(fv5)
+fv6_mean = np.mean(fv6)
+fv7_mean = np.mean(fv7)
+fv8_mean = np.mean(fv8)
+fv9_mean = np.mean(fv9)
+fv10_mean = np.mean(fv10)
+fv11_mean = np.mean(fv11)
+fv12_mean = np.mean(fv12)
+fv13_mean = np.mean(fv13)
+fv14_mean = np.mean(fv14)
+fv15_mean = np.mean(fv15)
+fv16_mean = np.mean(fv16)
+fv17_mean = np.mean(fv17)
+fv18_mean = np.mean(fv18)
+fv19_mean = np.mean(fv19)
+fv20_mean = np.mean(fv20)
+fv21_mean = np.mean(fv21)
+fv22_mean = np.mean(fv22)
+fv23_mean = np.mean(fv23)
+fv24_mean = np.mean(fv24)
+fv25_mean = np.mean(fv25)
+fv26_mean = np.mean(fv26)
+fv27_mean = np.mean(fv27)
+fv28_mean = np.mean(fv28)
+fv29_mean = np.mean(fv29)
+fv30_mean = np.mean(fv30)
+fv31_mean = np.mean(fv31)
+fv32_mean = np.mean(fv32)
+fv33_mean = np.mean(fv33)
+fv34_mean = np.mean(fv34)
+fv35_mean = np.mean(fv35)
+fv36_mean = np.mean(fv36)
+fv37_mean = np.mean(fv37)
+fv38_mean = np.mean(fv38)
+fv39_mean = np.mean(fv39)
+fv40_mean = np.mean(fv40)
+
+fv1_std = np.std(fv1)
+fv2_std = np.std(fv2)
+fv3_std = np.std(fv3)
+fv4_std = np.std(fv4)
+fv5_std = np.std(fv5)
+fv6_std = np.std(fv6)
+fv7_std = np.std(fv7)
+fv8_std = np.std(fv8)
+fv9_std = np.std(fv9)
+fv10_std = np.std(fv10)
+fv11_std = np.std(fv11)
+fv12_std = np.std(fv12)
+fv13_std = np.std(fv13)
+fv14_std = np.std(fv14)
+fv15_std = np.std(fv15)
+fv16_std = np.std(fv16)
+fv17_std = np.std(fv17)
+fv18_std = np.std(fv18)
+fv19_std = np.std(fv19)
+fv20_std = np.std(fv20)
+fv21_std = np.std(fv21)
+fv22_std = np.std(fv22)
+fv23_std = np.std(fv23)
+fv24_std = np.std(fv24)
+fv25_std = np.std(fv25)
+fv26_std = np.std(fv26)
+fv27_std = np.std(fv27)
+fv28_std = np.std(fv28)
+fv29_std = np.std(fv29)
+fv30_std = np.std(fv30)
+fv31_std = np.std(fv31)
+fv32_std = np.std(fv32)
+fv33_std = np.std(fv33)
+fv34_std = np.std(fv34)
+fv35_std = np.std(fv35)
+fv36_std = np.std(fv36)
+fv37_std = np.std(fv37)
+fv38_std = np.std(fv38)
+fv39_std = np.std(fv39)
+fv40_std = np.std(fv40)
+
+fv1_ = (fv1 - fv1_mean) / fv1_std
+fv2_ = (fv2 - fv2_mean) / fv2_std
+fv3_ = (fv3 - fv3_mean) / fv3_std
+fv4_ = (fv4 - fv4_mean) / fv4_std
+fv5_ = (fv5 - fv5_mean) / fv5_std
+fv6_ = (fv6 - fv6_mean) / fv6_std
+fv7_ = (fv7 - fv7_mean) / fv7_std
+fv8_ = (fv8 - fv8_mean) / fv8_std
+fv9_ = (fv9 - fv9_mean) / fv9_std
+fv10_ = (fv10 - fv10_mean) / fv10_std
+fv11_ = (fv11 - fv11_mean) / fv11_std
+fv12_ = (fv12 - fv12_mean) / fv12_std
+fv13_ = (fv13 - fv13_mean) / fv13_std
+fv14_ = (fv14 - fv14_mean) / fv14_std
+fv15_ = (fv15 - fv15_mean) / fv15_std
+fv16_ = (fv16 - fv16_mean) / fv16_std
+fv17_ = (fv17 - fv17_mean) / fv17_std
+fv18_ = (fv18 - fv18_mean) / fv18_std
+fv19_ = (fv19 - fv19_mean) / fv19_std
+fv20_ = (fv20 - fv20_mean) / fv20_std
+fv21_ = (fv21 - fv21_mean) / fv21_std
+fv22_ = (fv22 - fv22_mean) / fv22_std
+fv23_ = (fv23 - fv23_mean) / fv23_std
+fv24_ = (fv24 - fv24_mean) / fv24_std
+fv25_ = (fv25 - fv25_mean) / fv25_std
+fv26_ = (fv26 - fv26_mean) / fv26_std
+fv27_ = (fv27 - fv27_mean) / fv27_std
+fv28_ = (fv28 - fv28_mean) / fv28_std
+fv29_ = (fv29 - fv29_mean) / fv29_std
+fv30_ = (fv30 - fv30_mean) / fv30_std
+fv31_ = (fv31 - fv31_mean) / fv31_std
+fv32_ = (fv32 - fv32_mean) / fv32_std
+fv33_ = (fv33 - fv33_mean) / fv33_std
+fv34_ = (fv34 - fv34_mean) / fv34_std
+fv35_ = (fv35 - fv35_mean) / fv35_std
+fv36_ = (fv36 - fv36_mean) / fv36_std
+fv37_ = (fv37 - fv37_mean) / fv37_std
+fv38_ = (fv38 - fv38_mean) / fv38_std
+fv39_ = (fv39 - fv39_mean) / fv39_std
+fv40_ = (fv40 - fv40_mean) / fv40_std
+
+X = np.array([fv18_]).T
+f = X
+print(X)
+print("Caluculating for Feature Value is Finshed...")
+print("Starting Dimensionality Reduction ...")
+
+# f_reduced = PCA(n_components = 2).fit_transform(f)                                                                      #PCA
+#f_reduced = manifold.TSNE(n_components=2).fit_transform(X)  # t SNE
+# f_reduced = manifold.Isomap(n_neighbors = 2, n_components = 2).fit_transform(f)                                        #Isomap
+# f_reduced = manifold.LocallyLinearEmbedding(n_neighbors = 2, n_components = 2, method = "standard").fit_transform(f)   #Locally Linear Embedding
+# f_reduced = manifold.LocallyLinearEmbedding(n_neighbors = 2, n_components = 2, method = "modified").fit_transform(f)   #Modified Loccaly Linear Embedding
+# f_reduced = manifold.LocallyLinearEmbedding(n_neighbors = 2, n_components = 2, method = "hessian").fit_transform(f)    #Hessian LLE Embedding
+# f_reduced = manifold.SpectralEmbedding(n_components = 2, random_state = 0, eigen_solver = "arpack").fit_transform(f)   #Spectral Embedding
+# f_reduced = manifold.LocallyLinearEmbedding(n_neighbors = 2, n_components = 2, method = "ltsa").fit_transform(f)       #Local Tangent Space Alignment
+# f_reduced = manifold.MDS(n_components = 2, n_init = 1, max_iter = 100).fit_transform(f)                                #Multi Dimensional Scaling
+# f_reduced = ensemble.RandomTreesEmbedding(n_estimators = 200, random_state = 0, max_depth = 5).fit_transform(f)        #Random Forest Embedding
+
+
+distortions = []
+
+for j in range(1, 11):
+    count = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    gmm = mixture.GaussianMixture(n_components=j, covariance_type='full')
+    z_gmm = gmm.fit(X)
+    result_G = z_gmm.predict(X)
+    print(result_G)
+
+    proba = gmm.predict_proba(f)
+
+    distortions.append(gmm.bic(f))
+    # distortions.append(gmm.aic(f))
+    '''
+    for m in range(f.shape[0]):
+        if (result_G[m] == 0 and count[0] == 0):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[0], label="c0")
+            count[0] = 1
+        if (result_G[m] == 0 and count[0] == 1):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[0])
+        if (result_G[m] == 1 and count[1] == 0):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[1], label="c1")
+            count[1] = 1
+        if (result_G[m] == 1 and count[1] == 1):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[1])
+        if (result_G[m] == 2 and count[2] == 0):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[2], label="c2")
+            count[2] = 1
+        if (result_G[m] == 2 and count[2] == 1):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[2])
+        if (result_G[m] == 3 and count[3] == 0):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[3], label="c3")
+            count[3] = 1
+        if (result_G[m] == 3 and count[3] == 1):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[3])
+        if (result_G[m] == 4 and count[4] == 0):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[4], label="c4")
+            count[4] = 1
+        if (result_G[m] == 4 and count[4] == 1):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[4])
+        if (result_G[m] == 5 and count[5] == 0):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[5], label="c5")
+            count[5] = 1
+        if (result_G[m] == 5 and count[5] == 1):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[5])
+        if (result_G[m] == 6 and count[6] == 0):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[6], label="c6")
+            count[6] = 1
+        if (result_G[m] == 6 and count[6] == 1):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[6])
+        if (result_G[m] == 7 and count[7] == 0):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[7], label="c7")
+            count[7] = 1
+        if (result_G[m] == 7 and count[7] == 1):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[7])
+        if (result_G[m] == 8 and count[8] == 0):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[8], label="c8")
+            count[8] = 1
+        if (result_G[m] == 8 and count[8] == 1):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[8])
+        if (result_G[m] == 9 and count[9] == 0):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[9], label="c9")
+            count[9] = 1
+        if (result_G[m] == 9 and count[9] == 1):
+            plt.scatter(f_reduced[m, 0], f_reduced[m, 1], color=colorlist[9])
+
+    plt.xlabel('PCA_parameter1')
+    plt.ylabel('PCA_parameter2')
+    plt.title("S-S Curve " + str(j) + " Class Clustering")
+    plt.legend()
+    plt.show()
+    '''
+    max_index_list = []
+
+    for k in range(j):  # GMMで各クラスターの中で最も確率の高いサンプルをリファレンスとしてプロットしていく
+        max_index = np.argmax(proba[:, k])
+        max_index_list.append(max_index)
+        ref_data = f_name[max_index_list[k]]
+        df = pd.read_csv(folder_name + "/" + ref_data, encoding="shift-jis", header=None)
+        df_ = pd.isnull(df.iat[0, 3])
+
+        if (df_ == True):
+            cs = df.iat[0, 1]
+            nl = df.iat[0, 2]
+
+            x_ = df.iloc[1:, 3:4]
+            x = x_ / nl
+
+            y_ = df.iloc[1:, 1:2]
+            y = np.array(y_).reshape(-1, ) * 1000 / cs
+
+        else:
+            cs1 = df.iat[0, 1]
+            cs2 = df.iat[0, 2]
+            cs = cs1 * cs2
+            nl = df.iat[0, 3]
+
+            x_ = df.iloc[1:, 3:4]
+            x = x_ / nl
+
+            y_ = df.iloc[1:, 1:2]
+            y = np.array(y_).reshape(-1, ) * 1000 / cs
+
+        if (result_G[max_index_list[k]] == 0):  # リファレンスカーブ描写のための苦肉の策
+            plt.plot(x, y, label=f_name[max_index_list[k]] + " / c0", color=colorlist[0])
+        if (result_G[max_index_list[k]] == 1):
+            plt.plot(x, y, label=f_name[max_index_list[k]] + " / c1", color=colorlist[1])
+        if (result_G[max_index_list[k]] == 2):
+            plt.plot(x, y, label=f_name[max_index_list[k]] + " / c2", color=colorlist[2])
+        if (result_G[max_index_list[k]] == 3):
+            plt.plot(x, y, label=f_name[max_index_list[k]] + " / c3", color=colorlist[3])
+        if (result_G[max_index_list[k]] == 4):
+            plt.plot(x, y, label=f_name[max_index_list[k]] + " / c4", color=colorlist[4])
+        if (result_G[max_index_list[k]] == 5):
+            plt.plot(x, y, label=f_name[max_index_list[k]] + " / c5", color=colorlist[5])
+        if (result_G[max_index_list[k]] == 6):
+            plt.plot(x, y, label=f_name[max_index_list[k]] + " / c6", color=colorlist[6])
+        if (result_G[max_index_list[k]] == 7):
+            plt.plot(x, y, label=f_name[max_index_list[k]] + " / c7", color=colorlist[7])
+        if (result_G[max_index_list[k]] == 8):
+            plt.plot(x, y, label=f_name[max_index_list[k]] + " / c8", color=colorlist[8])
+        if (result_G[max_index_list[k]] == 9):
+            plt.plot(x, y, label=f_name[max_index_list[k]] + " / c9", color=colorlist[9])
+        plt.title('Reference Curves for each Clusters')
+        plt.xlabel('strain')
+        plt.ylabel('stress [MPa]')
+        plt.legend()
+
+    plt.show()
+
+plt.plot(range(1, 11), distortions, marker='o')  # BICもしくはAICがクラスタ数でどう変化するかを図示する
+plt.xlabel('Number of clusters')
+plt.ylabel('BIC')
+plt.show()
+
+print('Class number?')
+Class_num = input()
+print("Starting Clustering...")
+gmm = mixture.GaussianMixture(n_components = int(Class_num), covariance_type='full')
+z_gmm = gmm.fit(X)
+result_G = z_gmm.predict(X)
+proba = gmm.predict_proba(X)
+
+X = np.array(
+    [fv1_, fv2_, fv3_, fv4_, fv5_, fv6_, fv7_, fv8_, fv9_, fv10_, fv11_, fv12_, fv13_, fv14_, fv15_, fv16_, fv17_,
+     fv18_, fv19_, fv20_, fv21_, fv22_, fv23_, fv24_, fv25_, fv26_, fv27_, fv28_, fv29_, fv30_, fv31_, fv32_, fv33_,
+     fv34_, fv35_, fv36_, fv37_, fv38_, fv39_, fv40_]).T
+
+print("GMM Fitting is Finished...")
+print("Starting Multi Class Logistic Regression...")
+
+print(result_G)
+ohe = OneHotEncoder()
+result = ohe.fit_transform(result_G[:, np.newaxis]).toarray()
+
+Y = result
+W = np.full((X.shape[1] + 1, Y.shape[1]), 1)
+# X = np.concatenate((np.ones((X.shape[0], 1)), X), 1)  # バイアス項の追加
+
+# l1ノルム正則化ロジスティック回帰
+# X:学習用データベクトルを列ベクトルとして並べた行列
+
+for m in range(1, 100):
+    clf = linear_model.LogisticRegression(penalty='l1', tol=1e-5, C=0.01 * m, fit_intercept=True, max_iter=10000,
+                                          multi_class='multinomial', solver='saga').fit(X, result_G)
+    # print (clf.predict_proba(X))
+    print(clf.score(X, result_G))
+    plt.scatter(m, clf.score(X, result_G))
+    print(clf.coef_)
+
+    if (clf.score(X, result_G) > 0.98 or m == 99):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws = wb.create_sheet(title = folder_name + "_" + Class_num)
+        wb.save(folder_name + "_" + Class_num)
+        df_coef = pd.DataFrame(clf.coef_)
+        df_coef.to_excel(folder_name + "_" + Class_num + '.xlsx', sheet_name = folder_name + "_" + Class_num)
+        break
+
+plt.show()
+
+for k in range(int(Class_num)):
+    max_index = np.argmax(proba[:, k])
+    max_index_list.append(max_index)
+    ref_data = f_name[max_index_list[k]]
+    df = pd.read_csv(folder_name + "/" + ref_data, encoding="shift-jis", header=None)
+    df_ = pd.isnull(df.iat[0, 3])
+
+    if (df_ == True):
+        cs = df.iat[0, 1]
+        nl = df.iat[0, 2]
+
+        x_ = df.iloc[1:, 3:4]
+        x = x_ / nl
+
+        y_ = df.iloc[1:, 1:2]
+        y = np.array(y_).reshape(-1, ) * 1000 / cs
+
+    else:
+        cs1 = df.iat[0, 1]
+        cs2 = df.iat[0, 2]
+        cs = cs1 * cs2
+        nl = df.iat[0, 3]
+
+        x_ = df.iloc[1:, 3:4]
+        x = x_ / nl
+
+        y_ = df.iloc[1:, 1:2]
+        y = np.array(y_).reshape(-1, ) * 1000 / cs
+
+    if (result_G[max_index_list[k]] == 0):  # リファレンスカーブ描写のための苦肉の策
+        plt.plot(x, y, label=f_name[max_index_list[k]] + " / c0", color=colorlist[0])
+    if (result_G[max_index_list[k]] == 1):
+        plt.plot(x, y, label=f_name[max_index_list[k]] + " / c1", color=colorlist[1])
+    if (result_G[max_index_list[k]] == 2):
+        plt.plot(x, y, label=f_name[max_index_list[k]] + " / c2", color=colorlist[2])
+    if (result_G[max_index_list[k]] == 3):
+        plt.plot(x, y, label=f_name[max_index_list[k]] + " / c3", color=colorlist[3])
+    if (result_G[max_index_list[k]] == 4):
+        plt.plot(x, y, label=f_name[max_index_list[k]] + " / c4", color=colorlist[4])
+    if (result_G[max_index_list[k]] == 5):
+        plt.plot(x, y, label=f_name[max_index_list[k]] + " / c5", color=colorlist[5])
+    if (result_G[max_index_list[k]] == 6):
+        plt.plot(x, y, label=f_name[max_index_list[k]] + " / c6", color=colorlist[6])
+    if (result_G[max_index_list[k]] == 7):
+        plt.plot(x, y, label=f_name[max_index_list[k]] + " / c7", color=colorlist[7])
+    if (result_G[max_index_list[k]] == 8):
+        plt.plot(x, y, label=f_name[max_index_list[k]] + " / c8", color=colorlist[8])
+    if (result_G[max_index_list[k]] == 9):
+        plt.plot(x, y, label=f_name[max_index_list[k]] + " / c9", color=colorlist[9])
+    plt.title('Reference Curves for each Clusters')
+    plt.xlabel('strain')
+    plt.ylabel('stress [MPa]')
+    plt.legend()
+
+plt.show()
